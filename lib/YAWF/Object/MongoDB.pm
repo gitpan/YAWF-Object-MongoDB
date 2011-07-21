@@ -5,6 +5,8 @@ use warnings;
 use strict;
 no strict 'refs';
 
+use Data::Dumper;
+
 use MongoDB;
 use MongoDB::OID;
 
@@ -25,12 +27,12 @@ it can be used standalone without YAWF even installed.
 
 =cut
 
-our $VERSION = '0.01';
+our $VERSION = '0.02';
 
 our $DEFAULT_SERVER     = '';          # Use localhost with default port
 our $DEFAULT_DATABASE   = 'default';
 our $DEFAULT_COLLECTION = 'default';
-our $DEBUG              = $ENV{YAWF_MONGODB_TRACE} || 0;
+our $DEBUG = $ENV{YAWF_MONGODB_TRACE} || 0;
 
 my %SERVER;
 my %DATABASE;
@@ -143,7 +145,8 @@ sub list {
             $mongo_attr{skip} =
               $mongo_attr{limit} * ( $attributes->{page} - 1 );
             delete $attributes->{page};
-        } else {
+        }
+        else {
             warn $class
               . ' attribute page specified but rows is missing, page ignored';
         }
@@ -151,13 +154,18 @@ sub list {
 
     if ( $attributes->{order_by} ) {
         $mongo_attr{sort_by} =
-          [ $class->_resolv_sort( $attributes->{order_by} ) ];
+          [ reverse $class->_resolv_sort( $attributes->{order_by} ) ];
+        $mongo_attr{sort_by} = $mongo_attr{sort_by}->[0]
+          if $#{ $mongo_attr{sort_by} } == 0;
         delete $attributes->{order_by};
     }
 
-    return
-      map { bless { _document => $_ }, $class; }
-      $class->_collection->query( $filter, $attributes )->all;
+    my @list = $class->_collection->query( $filter, \%mongo_attr )->all;
+
+    warn Dumper( $filter, \%mongo_attr, $class->_database->last_error )
+      if $DEBUG;
+
+    return map { bless { _document => $_ }, $class; } @list;
 
 }
 
@@ -200,18 +208,22 @@ sub new {
     my $class = shift;
 
     warn $class . ' new with (' . join( ',', @_ ) . ")\n" if $DEBUG;
+
+    my $self = bless { }, $class;
+
     my $document;
     if ( $#_ > 0 ) {
-        $document = $class->_collection->find_one( {@_} );
-        return unless $document;
-    } elsif ( ( $#_ == 0 ) and defined( $_[0] ) and ( $_[0] ne '' ) ) {
+        $self->_fetchgroup({@_},0);
+        return unless $self->{_document};
+    }
+    elsif ( ( $#_ == 0 ) and defined( $_[0] ) and ( $_[0] ne '' ) ) {
         die 'id ' . $_[0] . ' is a ' . ref( $_[0] ) if ref( $_[0] );
-        $document = $class->_collection->find_one(
-            { _id => MongoDB::OID->new( value => $_[0] ) } );
-        return unless $document;
+        $self->_fetchgroup(
+            { _id => MongoDB::OID->new( value => $_[0] ) },0 );
+        return unless $self->{_document};
     }
 
-    return bless { _document => $document }, $class;
+    return $self;
 }
 
 =head2 get_column
@@ -227,6 +239,16 @@ sub get_column {
     my $key  = shift;
 
     return $self->{_changes}->{$key} if defined( $self->{_changes}->{$key} );
+
+    if (!exists($self->{_document}->{$key})) {
+        my $class = $self->_unify;
+        if (${$class.'::KEYGROUPS'}->{$key}){
+        $self->_fetchgroup(undef,${$class.'::KEYGROUPS'}->{$key});} else {
+            # Requested key is not within a group, fetch whole document
+            $self->_fetchgroup(undef,undef);
+        }
+    }
+
     return $self->{_document}->{$key};
 }
 
@@ -283,10 +305,10 @@ Flags column $key as changed (will be flushed on next ->flush call).
 =cut
 
 sub changed {
-    my $self  = shift;
-    my $key   = shift;
+    my $self = shift;
+    my $key  = shift;
 
-    return if exists($self->{_changes}->{$key});
+    return if exists( $self->{_changes}->{$key} );
 
     $self->{_changes}->{$key} = $self->get_column($key);
 }
@@ -333,11 +355,13 @@ sub flush {
             $self->{_document} = $self->{_changes};   # Copy changes to document
             $self->{_document}->{_id} = $id;    # Store id in local document
             delete $self->{_changes};           # All changes are flushed
-        } else {
+        }
+        else {
             warn 'Error inserting a ' . $self->_unify . ' document';
             return undef;
         }
-    } elsif ( scalar( keys( %{ $self->{_changes} } ) ) ) {
+    }
+    elsif ( scalar( keys( %{ $self->{_changes} } ) ) ) {
         warn $self->_unify
           . " Update document "
           . $self->id
@@ -345,7 +369,6 @@ sub flush {
           . join( ', ', keys( %{ $self->{_changes} } ) ) . "\n"
           if $DEBUG;
 
-        # TODO: Add $inc, $push, etc. capabilities
         $self->_collection->update(
             { _id    => MongoDB::OID->new( value => $self->id ) },
             { '$set' => $self->{_changes} } );
@@ -435,59 +458,112 @@ sub import {
     $DATABASE{$objclass}   = $args{database}   if defined( $args{database} );
     $COLLECTION{$objclass} = $args{collection} if defined( $args{collection} );
 
-    if ( ref( $args{keys} ) eq 'ARRAY' ) {
-        for my $key ( @{ $args{keys} } ) {
-            *{ $objclass . '::' . $key } =
-              sub { return shift->getset_column( $key, @_ ) };
-        }
-    } elsif ( ref( $args{keys} ) eq 'HASH' ) {
-        for my $key ( keys %{ $args{keys} } ) {
-            if (ref($args{keys}->{$key})) {
-                my $class = lcfirst($key);
-                $class =~ s/\W+/\_/g;
-                $class = $objclass.'::'.$class;
+    # No groups defined? Everything into group 0
+    if ( ref( $args{keys} ) eq 'ARRAY' and !ref( $args{keys}->[0] ) ) {
 
-                @{ 'YAWF::Object::MongoDB::Data::'.$class. '::ISA' } = ('YAWF::Object::MongoDB::Data');
-                ${ 'YAWF::Object::MongoDB::Data::'.$class. '::PARENT_CLASS' } = $objclass;
+        # Full key list into group 0
+        $args{keys} = [ $args{keys} ];
+    }
+    elsif ( ref( $args{keys} ) eq 'HASH' ) {
+        $args{keys} = [ $args{keys} ];
+    }
 
-                if (ref($args{keys}->{$key}) eq 'HASH') {
-                    # TODO: Process deep data objects
-                    for my $subkey (keys(%{$args{keys}->{$key}})) {
-                        *{ 'YAWF::Object::MongoDB::Data::'.$class . '::' . $subkey } =
-                          (ref($args{keys}->{$key}->{$subkey}) eq 'CODE') ? $args{keys}->{$key}->{$subkey} :
-                          sub { return shift->YAWF::Object::MongoDB::Data::getset_column( $subkey, @_ ) };
-                    }
-                } elsif (ref($args{keys}->{$key}) eq 'ARRAY') {
-                    # TODO: Process deep data objects
-                    for my $subkey (@{$args{keys}->{$key}}) {
-                        *{ 'YAWF::Object::MongoDB::Data::'.$class . '::' . $subkey } =
-                          sub { return shift->getset_column( $subkey, @_ ) };
-                    }
-                }
+    my @groups;
+    my %keygroups;
 
-                *{ $objclass. '::' . $key } =
-                  sub {
-                      my $self = shift;
-                      
-                      if (!$self->{_subobj}->{$key}) {
-                        $self->set_column($key,{}) unless $self->get_column($key);
-                        $self->{_subobj}->{$key} = bless {
-                                _parent => $self, # Top object
-                                _top => $key,     # Key of top object
-                                _data => $self->get_column($key), # Hash-ref of my parent
-                            },'YAWF::Object::MongoDB::Data::'.$class;
-                        
-                      }
-                      
-                      return $self->{_subobj}->{$key};
-                  };
+    for my $group ( 0 .. $#{ $args{keys} } ) {
 
-            } else {
+        my $keygroup = $args{keys}->[$group];
+
+        if ( ref($keygroup) eq 'ARRAY' ) {
+            for my $key ( @{$keygroup} ) {
+                push @{ $groups[$group] }, $key;
+                push @{$keygroups{$key}},$group;
+
+                next if $objclass->can($key) ;
+
                 *{ $objclass . '::' . $key } =
                   sub { return shift->getset_column( $key, @_ ) };
             }
         }
+        elsif ( ref( $keygroup ) eq 'HASH' ) {
+
+            for my $key ( keys %{$keygroup} ) {
+                my $val = $keygroup->{$key};
+
+                push @{ $groups[$group] }, $key;
+                push @{$keygroups{$key}},$group;
+
+                next if $objclass->can($key) ;
+
+                if ( ref($val) ) {
+                    my $class = lcfirst($key);
+                    $class =~ s/\W+/\_/g;
+                    $class = $objclass . '::' . $class;
+
+                    @{ 'YAWF::Object::MongoDB::Data::' . $class . '::ISA' } =
+                      ('YAWF::Object::MongoDB::Data');
+                    ${      'YAWF::Object::MongoDB::Data::' . $class
+                          . '::PARENT_CLASS' } = $objclass;
+
+                    if ( ref($val) eq 'HASH' ) {
+
+                        # TODO: Process deep data objects
+                        for my $subkey ( keys( %{$val} ) ) {
+                            *{      'YAWF::Object::MongoDB::Data::' 
+                                  . $class . '::'
+                                  . $subkey } =
+                              ( ref( $val->{$subkey} ) eq 'CODE' )
+                              ? $val->{$subkey}
+                              : sub {
+                                return
+                                  shift
+                                  ->YAWF::Object::MongoDB::Data::getset_column(
+                                    $subkey, @_ );
+                              };
+                        }
+                    }
+                    elsif ( ref($val) eq 'ARRAY' ) {
+
+                        # TODO: Process deep data objects
+                        for my $subkey ( @{$val} ) {
+                            *{      'YAWF::Object::MongoDB::Data::' 
+                                  . $class . '::'
+                                  . $subkey } =
+                              sub { return shift->getset_column( $subkey, @_ ) };
+                        }
+                    }
+
+                    *{ $objclass . '::' . $key } = sub {
+                        my $self = shift;
+
+                        if ( !$self->{_subobj}->{$key} ) {
+                            $self->set_column( $key, {} )
+                              unless $self->get_column($key);
+                            $self->{_subobj}->{$key} = bless {
+                                _parent => $self,    # Top object
+                                _top    => $key,     # Key of top object
+                                _data => $self->get_column($key)
+                                ,                    # Hash-ref of my parent
+                              },
+                              'YAWF::Object::MongoDB::Data::' . $class;
+
+                        }
+
+                        return $self->{_subobj}->{$key};
+                    };
+
+                }
+                else {
+                    *{ $objclass . '::' . $key } =
+                      sub { return shift->getset_column( $key, @_ ) };
+                }
+            }
+        }
     }
+
+    ${$objclass.'::GROUPS'} = \@groups;
+    ${$objclass.'::KEYGROUPS'} = \%keygroups;
 
 }
 
@@ -504,6 +580,28 @@ sub _unify {
     return $self;                       # Class
 }
 
+=head2 _server_name
+
+Get the current server name string
+
+=cut
+
+sub _server_name {
+    my $self = shift;
+
+    my $class = $self->_unify;
+
+    return
+         ${ $class . '::SERVER' }
+      || $SERVER{$class}
+      || (
+        ( $YAWF && YAWF->SINGLETON && YAWF->SINGLETON->config )
+        ? YAWF->SINGLETON->config->{mongodb}->{server}
+        : 0
+      )
+      || $DEFAULT_SERVER;
+}
+
 =head2 _server
 
 Get a server connection handler
@@ -515,11 +613,7 @@ sub _server {
 
     my $class = $self->_unify;
 
-    my $server =
-         $class::SERVER
-      || $SERVER{$class}
-      || ( ($YAWF && YAWF->SINGLETON && YAWF->SINGLETON->config) ? YAWF->SINGLETON->config->{mongodb}->{server} : 0 )
-      || $DEFAULT_SERVER;
+    my $server = $class->_server_name;
 
     if ( !defined( $SERVER_CACHE{$server} ) ) {
 
@@ -531,7 +625,8 @@ sub _server {
         if ( $server =~ /^(\w+)\:(\d+)$/ ) {
             $conn_args{host} = $1;
             $conn_args{port} = $2;
-        } elsif ($server) {
+        }
+        elsif ($server) {
             $conn_args{host} = $server;
         }
 
@@ -541,6 +636,32 @@ sub _server {
     }
 
     return $SERVER_CACHE{$server};
+}
+
+=head2 _database_name
+
+Get the current database name string
+
+=cut
+
+sub _database_name {
+    my $self = shift;
+
+    my $class = $self->_unify;
+
+    return (
+             ${ $class . '::DATABASE' } 
+          || $DATABASE{$class}
+          || (
+            ( $YAWF && YAWF->SINGLETON && YAWF->SINGLETON->config )
+            ? YAWF->SINGLETON->config->{mongodb}->{database}
+            : 0
+          )
+          || $DEFAULT_DATABASE
+      )
+      . "\x00"
+      . $self->_server_name;
+
 }
 
 =head2 _database
@@ -554,11 +675,7 @@ sub _database {
 
     my $class = $self->_unify;
 
-    my $database =
-         $class::DATABASE
-      || $DATABASE{$class}
-      || ( ($YAWF && YAWF->SINGLETON && YAWF->SINGLETON->config) ? YAWF->SINGLETON->config->{mongodb}->{database} : 0 )
-      || $DEFAULT_DATABASE;
+    my $database = $class->_database_name;
 
     $DATABASE_CACHE{$database} ||= $self->_server->$database;
 
@@ -574,15 +691,27 @@ Get a collection handler
 sub _collection {
     my $self = shift;
 
+    return $self->{_collection}
+      if ref($self)
+          and defined( $self->{_collection} );
+
     my $class = $self->_unify;
 
     my $collection =
-         $class::COLLECTION
+         ${ $class . '::COLLECTION' }
       || $COLLECTION{$class}
-      || ( ($YAWF && YAWF->SINGLETON && YAWF->SINGLETON->config) ? YAWF->SINGLETON->config->{mongodb}->{collection} : 0 )
+      || (
+        ( $YAWF && YAWF->SINGLETON && YAWF->SINGLETON->config )
+        ? YAWF->SINGLETON->config->{mongodb}->{collection}
+        : 0
+      )
       || $DEFAULT_COLLECTION;
 
+    $collection .= "\x00" . $self->_database_name;
+
     $COLLECTION_CACHE{$collection} ||= $self->_database->$collection;
+
+    $self->{_collection} = $COLLECTION_CACHE{$collection} if ref($self);
 
     return $COLLECTION_CACHE{$collection};
 }
@@ -601,13 +730,50 @@ sub _resolv_sort {
     if ( ref($item) eq 'HASH' ) {
         return $self->_resolv_sort( $item->{-asc},  1 )  if $item->{-asc};
         return $self->_resolv_sort( $item->{-desc}, -1 ) if $item->{-desc};
-    } elsif ( ref($item) eq 'ARRAY' ) {
+    }
+    elsif ( ref($item) eq 'ARRAY' ) {
         return map { $self->_resolv_sort( $_, $order ); } @{$item};
-    } else {
+    }
+    else {
 
         # Only one key given, sort inc
         return { $item => $order };
     }
+}
+
+=head2 _fetchgroup
+
+Fetch a group of fields from the database, no return value.
+
+=cut
+
+sub _fetchgroup {
+    my $self  = shift;
+    my $filter = shift;
+    my $group = shift;
+
+    if (!defined($filter)){
+        # ->get_column would be a recursion!
+        my $id = defined( $self->{_changes}->{_id} ) ? $self->{_changes}->{_id} : undef;
+        $id ||= $self->{_document}->{_id}->value if $self->{_document} and $self->{_document}->{_id};
+        return unless $id;
+        $filter = { _id => MongoDB::OID->new( value => $id ) };
+    }
+
+    my $new_fields = $self->_collection->find_one($filter,(defined($group) ? {map { $_ => 1; } ( map {@{${$self->_unify.'::GROUPS'}->[$_]}} (ref($group) ? @{$group} : $group) )} : undef) );
+    return unless $new_fields;
+
+    # New document
+    if (!defined($self->{_document})) {
+        $self->{_document} = $new_fields;
+    } else {
+        # Add new keys
+        for my $key (keys(%{$new_fields})) {
+            next if $key eq '_id';
+            $self->{_document}->{$key} = $new_fields->{$key};
+        }
+    }
+
 }
 
 1;

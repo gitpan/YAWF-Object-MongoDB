@@ -7,6 +7,7 @@ license  'perl';
 
 build_requires 'Test::More';
 
+requires 'Data::Dumper' => 0;
 requires 'MongoDB' => 0.32;
 
 recommends 'YAWF'    => 0.01;
