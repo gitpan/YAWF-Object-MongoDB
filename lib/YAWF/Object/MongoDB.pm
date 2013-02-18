@@ -1,9 +1,10 @@
 package YAWF::Object::MongoDB;
 
 use 5.006;
-use warnings;
 use strict;
+use warnings;
 no strict 'refs';
+no warnings 'once';
 
 use Data::Dumper;
 
@@ -18,16 +19,16 @@ YAWF::Object::MongoDB - Object of a MongoDB document
 
 =head1 VERSION
 
-Version 0.01
+Version 0.03
 
 =head1 NOTICE
 
 This module has been written to be compatible to the YAWF::Object methods, but
-it can be used standalone without YAWF even installed.
+it can be used as a standalone MongoDB Object relational mapper (ORM) without YAWF even installed.
 
 =cut
 
-our $VERSION = '0.02';
+our $VERSION = '0.03';
 
 our $DEFAULT_SERVER     = '';          # Use localhost with default port
 our $DEFAULT_DATABASE   = 'default';
@@ -127,10 +128,6 @@ sub list {
     my $attributes = shift || {};
 
     # Quick way without attributes
-    return
-      map { bless { _document => $_ }, $class; }
-      $class->_collection->find($filter)->all
-      unless scalar( %{$attributes} );
 
     # Convert attributes and use MongoDB cursor
     my %mongo_attr;
@@ -160,7 +157,9 @@ sub list {
         delete $attributes->{order_by};
     }
 
-    my @list = $class->_collection->query( $filter, \%mongo_attr )->all;
+    my $query = $class->_collection->query( $filter, \%mongo_attr );
+    $query->fields( { map { $_ => 1; } @{ ${ $class . '::GROUPS' }->[0] } } );
+    my @list = $query->all;
 
     warn Dumper( $filter, \%mongo_attr, $class->_database->last_error )
       if $DEBUG;
@@ -209,17 +208,16 @@ sub new {
 
     warn $class . ' new with (' . join( ',', @_ ) . ")\n" if $DEBUG;
 
-    my $self = bless { }, $class;
+    my $self = bless {}, $class;
 
     my $document;
     if ( $#_ > 0 ) {
-        $self->_fetchgroup({@_},0);
+        $self->_fetchgroup( {@_}, 0 );
         return unless $self->{_document};
     }
     elsif ( ( $#_ == 0 ) and defined( $_[0] ) and ( $_[0] ne '' ) ) {
         die 'id ' . $_[0] . ' is a ' . ref( $_[0] ) if ref( $_[0] );
-        $self->_fetchgroup(
-            { _id => MongoDB::OID->new( value => $_[0] ) },0 );
+        $self->_fetchgroup( { '$or' => [{_id => MongoDB::OID->new( value => $_[0] )}, {_id => $_[0]}]  }, 0 );
         return unless $self->{_document};
     }
 
@@ -240,12 +238,15 @@ sub get_column {
 
     return $self->{_changes}->{$key} if defined( $self->{_changes}->{$key} );
 
-    if (!exists($self->{_document}->{$key})) {
+    if ( !exists( $self->{_document}->{$key} ) ) {
         my $class = $self->_unify;
-        if (${$class.'::KEYGROUPS'}->{$key}){
-        $self->_fetchgroup(undef,${$class.'::KEYGROUPS'}->{$key});} else {
+        if ( ${ $class . '::KEYGROUPS' }->{$key} ) {
+            $self->_fetchgroup( undef, ${ $class . '::KEYGROUPS' }->{$key} );
+        }
+        else {
+
             # Requested key is not within a group, fetch whole document
-            $self->_fetchgroup(undef,undef);
+            $self->_fetchgroup( undef, undef );
         }
     }
 
@@ -325,7 +326,7 @@ sub id {
     my $self = shift;
 
     return unless $self->get_column('_id');
-    return $self->get_column('_id')->value;
+    return ref($self->get_column('_id')) ? $self->get_column('_id')->value : $self->get_column('_id');
 }
 
 =head2 flush
@@ -343,8 +344,9 @@ new object.
 sub flush {
     my $self = shift;
 
-    if ( ( !$self->{_document}->{_id} )
-        and scalar( keys( %{ $self->{_changes} } ) ) )
+    return $self unless scalar( keys( %{ $self->{_changes} } ) );
+
+    if ( !$self->{_document}->{_id} )        
     {
         warn $self->_unify . " New document\n" if $DEBUG;
 
@@ -361,7 +363,7 @@ sub flush {
             return undef;
         }
     }
-    elsif ( scalar( keys( %{ $self->{_changes} } ) ) ) {
+    else {
         warn $self->_unify
           . " Update document "
           . $self->id
@@ -370,11 +372,11 @@ sub flush {
           if $DEBUG;
 
         $self->_collection->update(
-            { _id    => MongoDB::OID->new( value => $self->id ) },
+            { '$or' => [{_id => MongoDB::OID->new( value => $self->id )}, {_id => $self->id}]},
             { '$set' => $self->{_changes} } );
         my $result = $self->_database->last_error;
         if ( $result->{n} != 1 ) {
-            warn 'Error updating ' . $self->id . ': ' . $result->{err};
+            warn 'Error updating ' .__PACKAGE__.': '. ($self->id // '(undef id)') . ': ' . ($result->{err} // '(No error message)').' ('.$result->{n}.' updated)';
         }
     }
 
@@ -396,7 +398,7 @@ sub delete {
       if $self->id
           and (
               !$self->_collection->remove(
-                  { _id => MongoDB::OID->new( value => $self->id ) }
+                  { '$or' => [{_id => MongoDB::OID->new( value => $self->id )}, {_id => $self->id}]}
               )
           );
 
@@ -478,23 +480,23 @@ sub import {
         if ( ref($keygroup) eq 'ARRAY' ) {
             for my $key ( @{$keygroup} ) {
                 push @{ $groups[$group] }, $key;
-                push @{$keygroups{$key}},$group;
+                push @{ $keygroups{$key} }, $group;
 
-                next if $objclass->can($key) ;
+                next if $objclass->can($key);
 
                 *{ $objclass . '::' . $key } =
                   sub { return shift->getset_column( $key, @_ ) };
             }
         }
-        elsif ( ref( $keygroup ) eq 'HASH' ) {
+        elsif ( ref($keygroup) eq 'HASH' ) {
 
             for my $key ( keys %{$keygroup} ) {
                 my $val = $keygroup->{$key};
 
                 push @{ $groups[$group] }, $key;
-                push @{$keygroups{$key}},$group;
+                push @{ $keygroups{$key} }, $group;
 
-                next if $objclass->can($key) ;
+                next if $objclass->can($key);
 
                 if ( ref($val) ) {
                     my $class = lcfirst($key);
@@ -562,8 +564,8 @@ sub import {
         }
     }
 
-    ${$objclass.'::GROUPS'} = \@groups;
-    ${$objclass.'::KEYGROUPS'} = \%keygroups;
+    ${ $objclass . '::GROUPS' }    = \@groups;
+    ${ $objclass . '::KEYGROUPS' } = \%keygroups;
 
 }
 
@@ -593,6 +595,7 @@ sub _server_name {
 
     return
          ${ $class . '::SERVER' }
+      || ($class->can('SERVER') && $class->SERVER)
       || $SERVER{$class}
       || (
         ( $YAWF && YAWF->SINGLETON && YAWF->SINGLETON->config )
@@ -651,6 +654,7 @@ sub _database_name {
 
     return (
              ${ $class . '::DATABASE' } 
+          || ($class->can('DATABASE') && $class->DATABASE)
           || $DATABASE{$class}
           || (
             ( $YAWF && YAWF->SINGLETON && YAWF->SINGLETON->config )
@@ -699,6 +703,7 @@ sub _collection {
 
     my $collection =
          ${ $class . '::COLLECTION' }
+      || ($class->can('COLLECTION') && $class->COLLECTION)
       || $COLLECTION{$class}
       || (
         ( $YAWF && YAWF->SINGLETON && YAWF->SINGLETON->config )
@@ -748,27 +753,49 @@ Fetch a group of fields from the database, no return value.
 =cut
 
 sub _fetchgroup {
-    my $self  = shift;
+    my $self   = shift;
     my $filter = shift;
-    my $group = shift;
+    my $group  = shift;
 
-    if (!defined($filter)){
+    if ( !defined($filter) ) {
+
         # ->get_column would be a recursion!
-        my $id = defined( $self->{_changes}->{_id} ) ? $self->{_changes}->{_id} : undef;
-        $id ||= $self->{_document}->{_id}->value if $self->{_document} and $self->{_document}->{_id};
+        my $id =
+          defined( $self->{_changes}->{_id} )
+          ? $self->{_changes}->{_id}
+          : undef;
+        $id ||= $self->{_document}->{_id}->value
+          if $self->{_document} and $self->{_document}->{_id} and ref($self->{_document}->{_id});
         return unless $id;
-        $filter = { _id => MongoDB::OID->new( value => $id ) };
+        $filter = { '$or' => [{_id => MongoDB::OID->new( value => $id )}, {_id => $id}]  };
     }
 
-    my $new_fields = $self->_collection->find_one($filter,(defined($group) ? {map { $_ => 1; } ( map {@{${$self->_unify.'::GROUPS'}->[$_]}} (ref($group) ? @{$group} : $group) )} : undef) );
+    my @field_list;
+    for my $g ( ref($group) ? @{$group} : $group ) {
+        next unless defined($g);
+        push @field_list, @{ ${ $self->_unify . '::GROUPS' }->[$g] } if ${ $self->_unify . '::GROUPS' }->[$g];
+    }
+
+    my $new_fields = $self->_collection->find_one(
+        $filter,
+        (
+            $#field_list > -1
+            ? {
+                map { $_ => 1; } @field_list
+              }
+            : undef
+        )
+    );
     return unless $new_fields;
 
     # New document
-    if (!defined($self->{_document})) {
+    if ( !defined( $self->{_document} ) ) {
         $self->{_document} = $new_fields;
-    } else {
+    }
+    else {
+
         # Add new keys
-        for my $key (keys(%{$new_fields})) {
+        for my $key ( keys( %{$new_fields} ) ) {
             next if $key eq '_id';
             $self->{_document}->{$key} = $new_fields->{$key};
         }

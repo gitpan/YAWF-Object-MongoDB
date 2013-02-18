@@ -1,5 +1,9 @@
 Revision history for YAWF-Object-MongoDB
 
+0.03    2013-02-18
+        - Added grouping support for ->list
+        - Added support for SERVER, DATABASE and COLLECTION class methods
+
 0.02    2011-07-21
         - Fixed ->list option forwarding to MongoDB (SEWI)
         - Fix sort conversion bug, no [ ] unless neccessary (SEWI)

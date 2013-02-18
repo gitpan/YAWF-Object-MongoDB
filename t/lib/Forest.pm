@@ -1,17 +1,16 @@
-package t::lib::Forest;
+package t::lib::HeavyGroups;
 
 use strict;
 use warnings;
 
 use YAWF::Object::MongoDB (
-    collection => 'Y_O_M_Test_Forest',
-    keys       => [
-        {
-            birch => 1,
-            oak   => 1,
-            color => 1,
-        },
-        [ 'deer', 'boar','color' ],
+    collection => 'Y_O_M_Test_HeavyGroups',
+    keys       => [ {},
+                    { one => 1 },
+                    { two => 1 },
+                    { three => 1 },
+                    { four => 1 },
+                    { five => 1 },
     ]
 );
 
